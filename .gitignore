@@ -1,0 +1,6 @@
+**/*.bin
+**/*.zip
+client/launchers/*.o
+*.exe
+!bin/*.exe
+!bin/*.o
