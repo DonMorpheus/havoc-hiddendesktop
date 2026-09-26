@@ -70,6 +70,7 @@ Zobacz [README.md](README.md). Esencja:
 sudo apt install -y mingw-w64 nasm python3 python3-tk wine64
 make x64 && make server
 python3 scripts/hd-server.py        # probes wine64 + HVNC exe, START → :1337
+# LHOST: local NICs, WAN (public IP), or DNS name — implant gethostbyname
 # CLI: ./scripts/hd-listen.sh
 # Havoc: Load Script bin/hidden-desktop.py
 # Demon Admin (nie SYSTEM):

