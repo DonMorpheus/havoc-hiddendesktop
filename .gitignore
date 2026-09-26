@@ -4,3 +4,5 @@ client/launchers/*.o
 *.exe
 !bin/*.exe
 !bin/*.o
+__pycache__/
+*.pyc
